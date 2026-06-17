@@ -1,22 +1,29 @@
 /**
  * Compares "List A" and "List B" inventory tables on the Inventory sheet,
  * using a normalized Prime-item lookup table on the "Prime Data" sheet,
- * and writes four result tables to the Trades sheet:
+ * and writes six result tables to the Trades sheet:
  *   1. Extras from A wanted by B
  *   2. Extras from B wanted by A
- *   3. Extras from A to sell (grouped by Ducats, highest first)
- *   4. Extras from B to sell (grouped by Ducats, highest first)
+ *   3. Extras from A to sell for Ducats (grouped by Ducats, highest first)
+ *   4. Extras from B to sell for Ducats (grouped by Ducats, highest first)
+ *   5. List A parts to sell on market (alphabetical by Set/Part)
+ *   6. List B parts to sell on market (alphabetical by Set/Part)
  *
  * --- Data model ---
  *
  * "Prime Data" sheet (the immutable lookup table):
- *   Columns: Set | Part | Ducats | Qty Required
+ *   Columns: Set | Part | Ducats | Qty Required | Sell on Market
  *   Row 1 = headers, data from row 2.
+ *   "Sell on Market" is any non-empty flag (e.g. "x") marking a part that,
+ *   when left over, should be routed to its own "sell on market" output
+ *   instead of the regular ducat-sorted "to sell" table. Flagged parts are
+ *   still offered to the other list first if that owner needs them --
+ *   the flag only changes where *leftover* extras land.
  *   One row per part of a Prime set, e.g.:
- *     Acceltra | Barrel     | 100 | 1
- *     Acceltra | Receiver   | 45  | 1
- *     Acceltra | Stock      | 65  | 1
- *     Acceltra | Blueprint  | 15  | 1
+ *     Acceltra | Barrel     | 100 | 1 |
+ *     Acceltra | Receiver   | 45  | 1 |
+ *     Acceltra | Stock      | 65  | 1 | x
+ *     Acceltra | Blueprint  | 15  | 1 |
  *
  * "Inventory" sheet (List A and List B, side by side):
  *   List A: columns A:C -> Set (Wanted) | Part | Owned
@@ -24,9 +31,10 @@
  *   Row 1 = title/name, Row 2 = headers, data from row 3.
  *
  *   "Set (Wanted)" cells look like "Acceltra (1)" meaning the owner wants
- *   1 full Acceltra set. This is read once per set (on its first row) and
- *   applies to every part row underneath it until the next named Set cell,
- *   matching the visual "merged cell" layout of the sheet.
+ *   1 full Acceltra set. If no "(n)" is present (e.g. just "Acceltra"),
+ *   wanting 1 set is assumed. This is read once per set (on its first row)
+ *   and applies to every part row underneath it until the next named Set
+ *   cell, matching the visual "merged cell" layout of the sheet.
  *
  *   A part that the owner has zero of is simply omitted from their list
  *   (e.g. no "Stock" row for Acceltra) -- the script infers Owned = 0 for
@@ -43,7 +51,7 @@ var PRIME_DATA_SHEET = 'Prime Data';
 var LIST_A_RANGE = 'A3:C'; // Set (Wanted), Part, Owned
 var LIST_B_RANGE = 'E3:G';
 
-var PRIME_DATA_RANGE = 'A2:D'; // Set, Part, Ducats, Qty Required
+var PRIME_DATA_RANGE = 'A2:E'; // Set, Part, Ducats, Qty Required, Sell on Market
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -67,9 +75,10 @@ function readPrimeData_(sheet) {
 
     var ducats = (row[2] === '' || row[2] === null) ? '' : row[2];
     var qtyRequired = (row[3] === '' || row[3] === null) ? 1 : Number(row[3]);
+    var sellOnMarket = (row[4] !== '' && row[4] !== null && String(row[4]).trim() !== '');
 
     if (!bySet[set]) bySet[set] = [];
-    bySet[set].push({ part: part, ducats: ducats, qtyRequired: qtyRequired });
+    bySet[set].push({ part: part, ducats: ducats, qtyRequired: qtyRequired, sellOnMarket: sellOnMarket });
   });
 
   return bySet;
@@ -87,8 +96,8 @@ function parseSetWantedCell_(raw) {
   if (match) {
     return { set: match[1].trim(), wantedSets: Number(match[2]) };
   }
-  // Fallback: no "(n)" found -- treat as a set name with 0 wanted.
-  return { set: text, wantedSets: 0 };
+  // Fallback: no "(n)" found -- default to wanting 1 full set.
+  return { set: text, wantedSets: 1 };
 }
 
 /**
@@ -149,6 +158,7 @@ function readList_(sheet, rangeA1, primeData) {
         set: setName,
         part: p.part,
         ducats: p.ducats,
+        sellOnMarket: p.sellOnMarket,
         wanted: wantedQty,
         owned: owned,
         extra: Math.max(owned - wantedQty, 0),
@@ -189,6 +199,8 @@ function compareLists() {
   var bWantedByA = [];
   var aToSell = [];
   var bToSell = [];
+  var aToSellOnMarket = [];
+  var bToSellOnMarket = [];
 
   listA.forEach(function (rowA) {
     if (rowA.extra <= 0) return;
@@ -201,7 +213,11 @@ function compareLists() {
       remaining -= transferable;
     }
     if (remaining > 0) {
-      aToSell.push({ set: rowA.set, part: rowA.part, ducats: rowA.ducats, qty: remaining });
+      if (rowA.sellOnMarket) {
+        aToSellOnMarket.push({ set: rowA.set, part: rowA.part, ducats: rowA.ducats, qty: remaining });
+      } else {
+        aToSell.push({ set: rowA.set, part: rowA.part, ducats: rowA.ducats, qty: remaining });
+      }
     }
   });
 
@@ -216,7 +232,11 @@ function compareLists() {
       remaining -= transferable;
     }
     if (remaining > 0) {
-      bToSell.push({ set: rowB.set, part: rowB.part, ducats: rowB.ducats, qty: remaining });
+      if (rowB.sellOnMarket) {
+        bToSellOnMarket.push({ set: rowB.set, part: rowB.part, ducats: rowB.ducats, qty: remaining });
+      } else {
+        bToSell.push({ set: rowB.set, part: rowB.part, ducats: rowB.ducats, qty: remaining });
+      }
     }
   });
 
@@ -242,11 +262,13 @@ function compareLists() {
   sortByDucats(bToSell);
   sortBySetPart(aWantedByB);
   sortBySetPart(bWantedByA);
+  sortBySetPart(aToSellOnMarket);
+  sortBySetPart(bToSellOnMarket);
 
-  writeOutput_(tradesSheet, aWantedByB, bWantedByA, aToSell, bToSell);
+  writeOutput_(tradesSheet, aWantedByB, bWantedByA, aToSell, bToSell, aToSellOnMarket, bToSellOnMarket);
 }
 
-function writeOutput_(sheet, aWantedByB, bWantedByA, aToSell, bToSell) {
+function writeOutput_(sheet, aWantedByB, bWantedByA, aToSell, bToSell, aToSellOnMarket, bToSellOnMarket) {
   sheet.clear();
 
   var row = 1;
@@ -259,8 +281,14 @@ function writeOutput_(sheet, aWantedByB, bWantedByA, aToSell, bToSell) {
   row = writeTable_(sheet, row, 'Extras from List A to sell (by Ducats)',
     ['Set', 'Part', 'Ducats', 'Qty'], aToSell);
   row += 2;
-  writeTable_(sheet, row, 'Extras from List B to sell (by Ducats)',
+  row = writeTable_(sheet, row, 'Extras from List B to sell (by Ducats)',
     ['Set', 'Part', 'Ducats', 'Qty'], bToSell);
+  row += 2;
+  row = writeTable_(sheet, row, 'List A parts to sell on market',
+    ['Set', 'Part', 'Ducats', 'Qty'], aToSellOnMarket);
+  row += 2;
+  writeTable_(sheet, row, 'List B parts to sell on market',
+    ['Set', 'Part', 'Ducats', 'Qty'], bToSellOnMarket);
 }
 
 function writeTable_(sheet, startRow, title, headers, rows) {
