@@ -101,23 +101,39 @@ function onOpen() {
 /**
  * One-time setup: installs an installable onEdit trigger so that ticking a
  * Resolve checkbox actually fires onEditResolve_ with full edit permissions
- * (simple onEdit cannot write to other sheets without this). Run this once
- * from the menu; re-running is harmless (it won't create duplicate triggers).
+ * (simple onEdit cannot write to other sheets without this).
+ *
+ * Safe to run two ways:
+ *   - From the spreadsheet's "Inventory Tools" menu (shows a popup alert).
+ *   - From the Apps Script editor's Run button (no spreadsheet UI exists in
+ *     that context, so SpreadsheetApp.getUi() would throw -- this falls
+ *     back to Logger.log instead, viewable via the editor's Execution log).
+ *
+ * Re-running is harmless either way; it won't create duplicate triggers.
  */
 function setupTrigger() {
+  function notify(message) {
+    try {
+      SpreadsheetApp.getUi().alert(message);
+    } catch (e) {
+      // No UI context (e.g. running from the script editor) -- log instead.
+      Logger.log(message);
+    }
+  }
+
   var triggers = ScriptApp.getProjectTriggers();
   var exists = triggers.some(function (t) {
     return t.getHandlerFunction() === 'onEditResolve_';
   });
   if (exists) {
-    SpreadsheetApp.getUi().alert('Resolve buttons are already enabled.');
+    notify('Resolve buttons are already enabled.');
     return;
   }
   ScriptApp.newTrigger('onEditResolve_')
     .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet())
     .onEdit()
     .create();
-  SpreadsheetApp.getUi().alert('Resolve buttons are now enabled.');
+  notify('Resolve buttons are now enabled.');
 }
 
 /**
