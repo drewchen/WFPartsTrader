@@ -1,13 +1,14 @@
 /**
  * Compares "List A" and "List B" inventory tables on the Inventory sheet,
  * using a normalized Prime-item lookup table on the "Prime Data" sheet,
- * and writes six result tables to the Trades sheet:
- *   1. Extras from A wanted by B
- *   2. Extras from B wanted by A
- *   3. Extras from A to sell for Ducats (grouped by Ducats, highest first)
- *   4. Extras from B to sell for Ducats (grouped by Ducats, highest first)
- *   5. List A parts to sell on market (alphabetical by Set/Part)
- *   6. List B parts to sell on market (alphabetical by Set/Part)
+ * and writes six result tables to the Trades sheet, each with a "Resolve"
+ * checkbox column that applies the trade/sale directly back to Inventory:
+ *   1. Extras from A wanted by B       (Resolve: A.Owned -1, B.Owned +1)
+ *   2. Extras from B wanted by A       (Resolve: B.Owned -1, A.Owned +1)
+ *   3. Extras from A to sell (Ducats)  (Resolve: A.Owned -1)
+ *   4. Extras from B to sell (Ducats)  (Resolve: B.Owned -1)
+ *   5. List A parts to sell on market  (Resolve: A.Owned -1)
+ *   6. List B parts to sell on market  (Resolve: B.Owned -1)
  *
  * --- Data model ---
  *
@@ -19,11 +20,6 @@
  *   instead of the regular ducat-sorted "to sell" table. Flagged parts are
  *   still offered to the other list first if that owner needs them --
  *   the flag only changes where *leftover* extras land.
- *   One row per part of a Prime set, e.g.:
- *     Acceltra | Barrel     | 100 | 1 |
- *     Acceltra | Receiver   | 45  | 1 |
- *     Acceltra | Stock      | 65  | 1 | x
- *     Acceltra | Blueprint  | 15  | 1 |
  *
  * "Inventory" sheet (List A and List B, side by side):
  *   List A: columns A:C -> Set (Wanted) | Part | Owned
@@ -31,17 +27,41 @@
  *   Row 1 = title/name, Row 2 = headers, data from row 3.
  *
  *   "Set (Wanted)" cells look like "Acceltra (1)" meaning the owner wants
- *   1 full Acceltra set. If no "(n)" is present (e.g. just "Acceltra"),
- *   wanting 1 set is assumed. This is read once per set (on its first row)
- *   and applies to every part row underneath it until the next named Set
- *   cell, matching the visual "merged cell" layout of the sheet.
+ *   1 full Acceltra set. If no "(n)" is present, wanting 1 set is assumed.
+ *   A part the owner has zero of can be omitted entirely from their list;
+ *   Owned = 0 is inferred for any part required by a wanted set that isn't
+ *   explicitly listed.
  *
- *   A part that the owner has zero of is simply omitted from their list
- *   (e.g. no "Stock" row for Acceltra) -- the script infers Owned = 0 for
- *   any part required by a wanted set that isn't explicitly listed.
+ * --- Resolve feature ---
+ *
+ * Each output row gets a checkbox in column E ("Resolve"). Columns F:G
+ * hold a hidden action payload (not for manual editing): F = action type
+ * ("transfer" or "sell"), G = a pipe-delimited descriptor of which Set+Part
+ * to update on which list (e.g. "sell|4|A|Acceltra|Stock"). Ticking the
+ * checkbox triggers onEditResolve_ (installed as an installable onEdit
+ * trigger -- see setupTrigger()), which:
+ *   1. Looks up the live Inventory row for the Set+Part fresh, by scanning
+ *      the sheet at the moment of the click (never relies on a cached row
+ *      number), so it stays correct even if earlier Resolve clicks in the
+ *      same session inserted or shifted rows.
+ *   2. Verifies the decrement won't go negative (warns and aborts if so,
+ *      leaving the checkbox unchecked, in case Inventory was hand-edited
+ *      since the last Compare Lists run).
+ *   3. Decrements the source Owned cell by 1 (floor 0, never deleted --
+ *      the row stays, just set to 0) and, for transfers, increments the
+ *      destination Owned cell by 1. If the destination part has no
+ *      existing row in Inventory, a new row is inserted directly under
+ *      that Set's last existing row.
+ *   4. Marks the Trades row "Finished": checkbox replaced with locked
+ *      "Finished" text, row grayed out.
+ *
+ * The Resolve column (and its hidden helper columns) are regenerated
+ * fresh every time Compare Lists runs, so previously-finished rows reset.
  *
  * Run via the "Inventory Tools > Compare Lists" custom menu, or directly
- * from the Apps Script editor by running compareLists().
+ * from the Apps Script editor by running compareLists(). Run setupTrigger()
+ * once (from the script editor, not the menu) to enable the Resolve
+ * buttons -- this requires one-time authorization.
  */
 
 var INVENTORY_SHEET = 'Inventory';
@@ -51,13 +71,69 @@ var PRIME_DATA_SHEET = 'Prime Data';
 var LIST_A_RANGE = 'A3:C'; // Set (Wanted), Part, Owned
 var LIST_B_RANGE = 'E3:G';
 
+// Column letters for List A / List B on Inventory (needed for direct writes
+// back to specific Owned cells, and for inserting new rows).
+var LIST_A_SET_COL = 1;   // A
+var LIST_A_PART_COL = 2;  // B
+var LIST_A_OWNED_COL = 3; // C
+var LIST_B_SET_COL = 5;   // E
+var LIST_B_PART_COL = 6;  // F
+var LIST_B_OWNED_COL = 7; // G
+var INVENTORY_DATA_START_ROW = 3;
+
 var PRIME_DATA_RANGE = 'A2:E'; // Set, Part, Ducats, Qty Required, Sell on Market
+
+// Trades sheet output column layout per table:
+// A=Set, B=Part, C=Ducats, D=Qty, E=Resolve (checkbox), F=action type (hidden),
+// G=action payload (hidden)
+var RESOLVE_COL = 5;
+var ACTION_TYPE_COL = 6;
+var ACTION_PAYLOAD_COL = 7;
 
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Inventory Tools')
     .addItem('Compare Lists', 'compareLists')
+    .addItem('Enable Resolve buttons (run once)', 'setupTrigger')
     .addToUi();
+}
+
+/**
+ * One-time setup: installs an installable onEdit trigger so that ticking a
+ * Resolve checkbox actually fires onEditResolve_ with full edit permissions
+ * (simple onEdit cannot write to other sheets without this).
+ *
+ * Safe to run two ways:
+ *   - From the spreadsheet's "Inventory Tools" menu (shows a popup alert).
+ *   - From the Apps Script editor's Run button (no spreadsheet UI exists in
+ *     that context, so SpreadsheetApp.getUi() would throw -- this falls
+ *     back to Logger.log instead, viewable via the editor's Execution log).
+ *
+ * Re-running is harmless either way; it won't create duplicate triggers.
+ */
+function setupTrigger() {
+  function notify(message) {
+    try {
+      SpreadsheetApp.getUi().alert(message);
+    } catch (e) {
+      // No UI context (e.g. running from the script editor) -- log instead.
+      Logger.log(message);
+    }
+  }
+
+  var triggers = ScriptApp.getProjectTriggers();
+  var exists = triggers.some(function (t) {
+    return t.getHandlerFunction() === 'onEditResolve_';
+  });
+  if (exists) {
+    notify('Resolve buttons are already enabled.');
+    return;
+  }
+  ScriptApp.newTrigger('onEditResolve_')
+    .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet())
+    .onEdit()
+    .create();
+  notify('Resolve buttons are now enabled.');
 }
 
 /**
@@ -209,15 +285,21 @@ function compareLists() {
 
     if (match && match.needed > 0) {
       var transferable = Math.min(remaining, match.needed);
-      aWantedByB.push({ set: rowA.set, part: rowA.part, ducats: rowA.ducats, qty: transferable });
+      aWantedByB.push({
+        set: rowA.set, part: rowA.part, ducats: rowA.ducats, qty: transferable,
+        action: 'transfer',
+        from: { list: 'A', set: rowA.set, part: rowA.part },
+        to: { list: 'B', set: rowA.set, part: rowA.part }
+      });
       remaining -= transferable;
     }
     if (remaining > 0) {
-      if (rowA.sellOnMarket) {
-        aToSellOnMarket.push({ set: rowA.set, part: rowA.part, ducats: rowA.ducats, qty: remaining });
-      } else {
-        aToSell.push({ set: rowA.set, part: rowA.part, ducats: rowA.ducats, qty: remaining });
-      }
+      var bucket = rowA.sellOnMarket ? aToSellOnMarket : aToSell;
+      bucket.push({
+        set: rowA.set, part: rowA.part, ducats: rowA.ducats, qty: remaining,
+        action: 'sell',
+        from: { list: 'A', set: rowA.set, part: rowA.part }
+      });
     }
   });
 
@@ -228,15 +310,21 @@ function compareLists() {
 
     if (match && match.needed > 0) {
       var transferable = Math.min(remaining, match.needed);
-      bWantedByA.push({ set: rowB.set, part: rowB.part, ducats: rowB.ducats, qty: transferable });
+      bWantedByA.push({
+        set: rowB.set, part: rowB.part, ducats: rowB.ducats, qty: transferable,
+        action: 'transfer',
+        from: { list: 'B', set: rowB.set, part: rowB.part },
+        to: { list: 'A', set: rowB.set, part: rowB.part }
+      });
       remaining -= transferable;
     }
     if (remaining > 0) {
-      if (rowB.sellOnMarket) {
-        bToSellOnMarket.push({ set: rowB.set, part: rowB.part, ducats: rowB.ducats, qty: remaining });
-      } else {
-        bToSell.push({ set: rowB.set, part: rowB.part, ducats: rowB.ducats, qty: remaining });
-      }
+      var bucketB = rowB.sellOnMarket ? bToSellOnMarket : bToSell;
+      bucketB.push({
+        set: rowB.set, part: rowB.part, ducats: rowB.ducats, qty: remaining,
+        action: 'sell',
+        from: { list: 'B', set: rowB.set, part: rowB.part }
+      });
     }
   });
 
@@ -270,6 +358,12 @@ function compareLists() {
 
 function writeOutput_(sheet, aWantedByB, bWantedByA, aToSell, bToSell, aToSellOnMarket, bToSellOnMarket) {
   sheet.clear();
+  // sheet.clear() does NOT remove data validation rules (including checkbox
+  // rules from prior runs). Clear them explicitly across the full sheet
+  // extent so stale checkbox validation from a longer prior run can't bleed
+  // into rows that the new run's insertCheckboxes() doesn't reach.
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
+  sheet.showColumns(1, 7); // in case columns were hidden from a prior run
 
   var row = 1;
   row = writeTable_(sheet, row, 'Extras from List A wanted by List B',
@@ -289,11 +383,256 @@ function writeOutput_(sheet, aWantedByB, bWantedByA, aToSell, bToSell, aToSellOn
   row += 2;
   writeTable_(sheet, row, 'List B parts to sell on market',
     ['Set', 'Part', 'Ducats', 'Qty'], bToSellOnMarket);
+
+  // Hide the helper columns (action type + payload) -- not for manual editing.
+  sheet.hideColumns(ACTION_TYPE_COL, 2);
+}
+
+/**
+ * Installable onEdit handler (see setupTrigger). Fires on every edit to
+ * the spreadsheet; only acts when the edit is a checkbox being checked
+ * in the Resolve column (E) of the Trades sheet, on a row that hasn't
+ * already been finished.
+ */
+function onEditResolve_(e) {
+  try {
+    var range = e.range;
+    var sheet = range.getSheet();
+    if (sheet.getName() !== TRADES_SHEET) return;
+    if (range.getColumn() !== RESOLVE_COL || range.getNumRows() !== 1 || range.getNumColumns() !== 1) return;
+    if (e.value !== 'TRUE') return; // only act on check, not uncheck
+
+    var row = range.getRow();
+    var actionType = sheet.getRange(row, ACTION_TYPE_COL).getValue();
+    var payload = sheet.getRange(row, ACTION_PAYLOAD_COL).getValue();
+    if (!actionType || !payload) return; // header/title/blank row, not a data row
+
+    var ok = applyResolveAction_(actionType, payload);
+
+    if (ok) {
+      markRowFinished_(sheet, row);
+    } else {
+      // Revert the checkbox so the row stays actionable.
+      range.setValue(false);
+    }
+  } catch (err) {
+    SpreadsheetApp.getUi().alert('Resolve failed: ' + err.message);
+    try { e.range.setValue(false); } catch (e2) { /* ignore */ }
+  }
+}
+
+/**
+ * Parses the pipe-delimited action payload and applies it to Inventory.
+ * Returns true on success, false if validation failed (e.g. would go
+ * negative because Inventory was hand-edited since the last compare).
+ */
+function applyResolveAction_(actionType, payload) {
+  var invSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INVENTORY_SHEET);
+  if (!invSheet) throw new Error('Inventory sheet not found.');
+
+  var parts = payload.split('|');
+
+  function parseSide(arr) {
+    return { list: arr[0], set: arr[1], part: arr[2] };
+  }
+
+  if (actionType === 'sell') {
+    // payload: sell|qty|list|set|part
+    var qty = Number(parts[1]);
+    var from = parseSide(parts.slice(2, 5));
+    return decrementOwned_(invSheet, from, qty);
+  }
+
+  if (actionType === 'transfer') {
+    // payload: transfer|qty|<from 3 fields>|<to 3 fields>
+    var qty = Number(parts[1]);
+    var from = parseSide(parts.slice(2, 5));
+    var to = parseSide(parts.slice(5, 8));
+
+    var fromRow = findInventoryRow_(invSheet, from);
+    if (!fromRow || Number(invSheet.getRange(fromRow, listColumns_(from.list).owned).getValue() || 0) < qty) {
+      SpreadsheetApp.getUi().alert(
+        'Could not resolve: ' + from.set + ' ' + from.part + ' on List ' + from.list +
+        ' does not have enough Owned to transfer ' + qty + ' (Inventory may have changed since Compare Lists last ran).');
+      return false;
+    }
+
+    decrementOwned_(invSheet, from, qty);
+    incrementOwned_(invSheet, to, qty);
+    return true;
+  }
+
+  throw new Error('Unknown action type: ' + actionType);
+}
+
+function listColumns_(listLetter) {
+  if (listLetter === 'A') {
+    return { set: LIST_A_SET_COL, part: LIST_A_PART_COL, owned: LIST_A_OWNED_COL };
+  }
+  return { set: LIST_B_SET_COL, part: LIST_B_PART_COL, owned: LIST_B_OWNED_COL };
+}
+
+/**
+ * Live scan of the Inventory sheet's List A or List B block to find the
+ * sheet row number currently holding this Set+Part, carrying the most
+ * recent non-blank Set cell down through blank-Set continuation rows
+ * (same convention as readList_). Returns null if no row exists yet for
+ * this Set+Part. Always reads fresh from the sheet -- never cached --
+ * so it stays correct even after previous Resolve actions inserted rows.
+ */
+function findInventoryRow_(invSheet, side) {
+  var cols = listColumns_(side.list);
+  var lastRow = invSheet.getLastRow();
+  if (lastRow < INVENTORY_DATA_START_ROW) return null;
+
+  var numRows = lastRow - INVENTORY_DATA_START_ROW + 1;
+  var setVals = invSheet.getRange(INVENTORY_DATA_START_ROW, cols.set, numRows, 1).getValues();
+  var partVals = invSheet.getRange(INVENTORY_DATA_START_ROW, cols.part, numRows, 1).getValues();
+
+  var currentSet = null;
+  for (var i = 0; i < numRows; i++) {
+    var setCell = String(setVals[i][0]).trim();
+    var part = String(partVals[i][0]).trim();
+
+    if (setCell !== '') {
+      var parsed = parseSetWantedCell_(setCell);
+      currentSet = parsed ? parsed.set : null;
+    }
+    if (part === '' || currentSet === null) continue;
+
+    if (currentSet === side.set && part === side.part) {
+      return INVENTORY_DATA_START_ROW + i;
+    }
+  }
+  return null;
+}
+
+/**
+ * Finds the last sheet row belonging to the given Set (for inserting a
+ * new part row directly underneath it), via the same live scan.
+ */
+function findLastRowForSet_(invSheet, listLetter, setName) {
+  var cols = listColumns_(listLetter);
+  var lastRow = invSheet.getLastRow();
+  if (lastRow < INVENTORY_DATA_START_ROW) return null;
+
+  var numRows = lastRow - INVENTORY_DATA_START_ROW + 1;
+  var setVals = invSheet.getRange(INVENTORY_DATA_START_ROW, cols.set, numRows, 1).getValues();
+  var partVals = invSheet.getRange(INVENTORY_DATA_START_ROW, cols.part, numRows, 1).getValues();
+
+  var currentSet = null;
+  var lastMatchingRow = null;
+  for (var i = 0; i < numRows; i++) {
+    var setCell = String(setVals[i][0]).trim();
+    var part = String(partVals[i][0]).trim();
+
+    if (setCell !== '') {
+      var parsed = parseSetWantedCell_(setCell);
+      currentSet = parsed ? parsed.set : null;
+    }
+    if (part === '' || currentSet === null) continue;
+
+    if (currentSet === setName) {
+      lastMatchingRow = INVENTORY_DATA_START_ROW + i;
+    }
+  }
+  return lastMatchingRow;
+}
+
+/**
+ * Decrements the Owned cell for this side by 1, floored at 0. The row is
+ * never deleted -- if Owned would go below 0, this returns false instead.
+ */
+function decrementOwned_(invSheet, side, qty) {
+  var rowNum = findInventoryRow_(invSheet, side);
+  if (!rowNum) {
+    SpreadsheetApp.getUi().alert(
+      'Could not resolve: ' + side.set + ' ' + side.part + ' on List ' + side.list +
+      ' has no Owned value to decrement (Inventory may have changed since Compare Lists last ran).');
+    return false;
+  }
+  var cols = listColumns_(side.list);
+  var cell = invSheet.getRange(rowNum, cols.owned);
+  var current = Number(cell.getValue() || 0);
+  if (current < qty) {
+    SpreadsheetApp.getUi().alert(
+      'Could not resolve: ' + side.set + ' ' + side.part + ' on List ' + side.list +
+      ' only has ' + current + ' Owned but needs to decrement by ' + qty +
+      ' (Inventory may have changed since Compare Lists last ran).');
+    return false;
+  }
+  cell.setValue(current - qty);
+  return true;
+}
+
+/**
+ * Increments the Owned cell for this side by 1. If no row currently exists
+ * for this Set+Part (the part was previously inferred at Owned=0 with no
+ * row on the sheet), a new row is inserted directly under the last known
+ * row of that Set, and Owned is set to 1.
+ *
+ * The new row's Set cell is EXPLICITLY written with the Set name and its
+ * wanted-count suffix (e.g. "Wukong (1)"), rather than left blank. Leaving
+ * it blank relies on "inherits from the row above" -- which only works
+ * cleanly when the row above is a real merged cell or you're manually
+/**
+ * Increments the Owned cell for this side by qty. If no row currently
+ * exists for this Set+Part (the part was previously inferred at Owned=0
+ * with no row on the sheet), a new row is inserted directly under the
+ * last known row of that Set, with the Set cell left blank so it inherits
+ * the Set name from the row above via the standard carry-down convention,
+ * and Owned set to qty.
+ *
+ * Uses Range.insertCells(Dimension.ROWS) scoped to just this list's 3
+ * columns (Set/Part/Owned) rather than Sheet.insertRowAfter(), so the
+ * other list's columns (same physical rows, different columns) are never
+ * shifted. Row lookup is always live, so this is safe after earlier
+ * Resolve actions have already inserted/shifted rows in the same session.
+ */
+function incrementOwned_(invSheet, side, qty) {
+  var cols = listColumns_(side.list);
+  var rowNum = findInventoryRow_(invSheet, side);
+
+  if (rowNum) {
+    var cell = invSheet.getRange(rowNum, cols.owned);
+    var current = Number(cell.getValue() || 0);
+    cell.setValue(current + qty);
+    return;
+  }
+
+  // No existing row for this Set+Part -- insert one under the set's last row,
+  // scoped to only this list's 3 columns (Set, Part, Owned).
+  var lastRowForSet = findLastRowForSet_(invSheet, side.list, side.set);
+  var insertAt = (lastRowForSet || INVENTORY_DATA_START_ROW - 1) + 1;
+  var firstCol = Math.min(cols.set, cols.part, cols.owned);
+  var lastCol = Math.max(cols.set, cols.part, cols.owned);
+  var numCols = lastCol - firstCol + 1;
+
+  invSheet.getRange(insertAt, firstCol, 1, numCols).insertCells(SpreadsheetApp.Dimension.ROWS);
+  // Set cell intentionally left blank -- carries down from the row above,
+  // matching the "blank = inherit" convention you use on Inventory.
+  invSheet.getRange(insertAt, cols.part).setValue(side.part);
+  invSheet.getRange(insertAt, cols.owned).setValue(qty);
+}
+
+/**
+ * Marks a Trades row as finished: replaces the checkbox with a locked,
+ * grayed-out "Finished" label.
+ */
+function markRowFinished_(sheet, row) {
+  var resolveCell = sheet.getRange(row, RESOLVE_COL);
+  resolveCell.removeCheckboxes();
+  resolveCell.setValue('Finished');
+
+  var fullRowRange = sheet.getRange(row, 1, 1, RESOLVE_COL);
+  fullRowRange.setFontColor('#999999').setFontStyle('italic');
+  resolveCell.setFontWeight('bold');
 }
 
 function writeTable_(sheet, startRow, title, headers, rows) {
+  var fullHeaders = headers.concat(['Resolve']);
   sheet.getRange(startRow, 1).setValue(title).setFontWeight('bold');
-  sheet.getRange(startRow + 1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+  sheet.getRange(startRow + 1, 1, 1, fullHeaders.length).setValues([fullHeaders]).setFontWeight('bold');
 
   var dataRow = startRow + 2;
 
@@ -302,10 +641,41 @@ function writeTable_(sheet, startRow, title, headers, rows) {
     return dataRow;
   }
 
+  // Write data columns A-D only (Set, Part, Ducats, Qty).
+  // Column E (Resolve) is intentionally excluded here -- insertCheckboxes()
+  // below will both apply the validation rule AND set initial value to false,
+  // so pre-writing false is unnecessary and risks confusing the range extent.
   var values = rows.map(function (r) {
     return [r.set, r.part, r.ducats, r.qty];
   });
   sheet.getRange(dataRow, 1, values.length, headers.length).setValues(values);
 
+  // Insert checkboxes into the Resolve column (E) for exactly the data rows.
+  var resolveRange = sheet.getRange(dataRow, RESOLVE_COL, values.length, 1);
+  resolveRange.insertCheckboxes();
+
+  // Write hidden action-type + payload columns (F, G) used by onEditResolve_.
+  var actionRows = rows.map(function (r) {
+    return [r.action, encodeAction_(r)];
+  });
+  sheet.getRange(dataRow, ACTION_TYPE_COL, actionRows.length, 2).setValues(actionRows);
+
   return dataRow + values.length - 1;
+}
+
+/**
+ * Encodes a Resolve action's payload into a single pipe-delimited string
+ * for storage in the hidden Trades column G. qty is encoded so the full
+ * amount is applied when Resolve is clicked rather than always 1:
+ *   "sell|4|A|Acceltra|Stock"
+ *   "transfer|2|A|Akarius|Barrel|B|Akarius|Barrel"
+ */
+function encodeAction_(r) {
+  function side(s) {
+    return [s.list, s.set, s.part].join('|');
+  }
+  if (r.action === 'transfer') {
+    return 'transfer|' + r.qty + '|' + side(r.from) + '|' + side(r.to);
+  }
+  return 'sell|' + r.qty + '|' + side(r.from);
 }
