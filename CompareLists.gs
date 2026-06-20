@@ -37,7 +37,7 @@
  * Each output row gets a checkbox in column E ("Resolve"). Columns F:G
  * hold a hidden action payload (not for manual editing): F = action type
  * ("transfer" or "sell"), G = a pipe-delimited descriptor of which Set+Part
- * to update on which list (e.g. "sell|A|Acceltra|Stock"). Ticking the
+ * to update on which list (e.g. "sell|4|A|Acceltra|Stock"). Ticking the
  * checkbox triggers onEditResolve_ (installed as an installable onEdit
  * trigger -- see setupTrigger()), which:
  *   1. Looks up the live Inventory row for the Set+Part fresh, by scanning
@@ -358,6 +358,11 @@ function compareLists() {
 
 function writeOutput_(sheet, aWantedByB, bWantedByA, aToSell, bToSell, aToSellOnMarket, bToSellOnMarket) {
   sheet.clear();
+  // sheet.clear() does NOT remove data validation rules (including checkbox
+  // rules from prior runs). Clear them explicitly across the full sheet
+  // extent so stale checkbox validation from a longer prior run can't bleed
+  // into rows that the new run's insertCheckboxes() doesn't reach.
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
   sheet.showColumns(1, 7); // in case columns were hidden from a prior run
 
   var row = 1;
@@ -432,27 +437,28 @@ function applyResolveAction_(actionType, payload) {
   }
 
   if (actionType === 'sell') {
-    var from = parseSide(parts.slice(1, 4));
-    return decrementOwned_(invSheet, from);
+    // payload: sell|qty|list|set|part
+    var qty = Number(parts[1]);
+    var from = parseSide(parts.slice(2, 5));
+    return decrementOwned_(invSheet, from, qty);
   }
 
   if (actionType === 'transfer') {
-    // payload: transfer|<from 3 fields>|<to 3 fields>
-    var fromParts = parts.slice(1, 4);
-    var toParts = parts.slice(4, 7);
-    var from = parseSide(fromParts);
-    var to = parseSide(toParts);
+    // payload: transfer|qty|<from 3 fields>|<to 3 fields>
+    var qty = Number(parts[1]);
+    var from = parseSide(parts.slice(2, 5));
+    var to = parseSide(parts.slice(5, 8));
 
     var fromRow = findInventoryRow_(invSheet, from);
-    if (!fromRow || Number(invSheet.getRange(fromRow, listColumns_(from.list).owned).getValue() || 0) < 1) {
+    if (!fromRow || Number(invSheet.getRange(fromRow, listColumns_(from.list).owned).getValue() || 0) < qty) {
       SpreadsheetApp.getUi().alert(
         'Could not resolve: ' + from.set + ' ' + from.part + ' on List ' + from.list +
-        ' is already at 0 Owned (Inventory may have changed since Compare Lists last ran).');
+        ' does not have enough Owned to transfer ' + qty + ' (Inventory may have changed since Compare Lists last ran).');
       return false;
     }
 
-    decrementOwned_(invSheet, from);
-    incrementOwned_(invSheet, to);
+    decrementOwned_(invSheet, from, qty);
+    incrementOwned_(invSheet, to, qty);
     return true;
   }
 
@@ -537,7 +543,7 @@ function findLastRowForSet_(invSheet, listLetter, setName) {
  * Decrements the Owned cell for this side by 1, floored at 0. The row is
  * never deleted -- if Owned would go below 0, this returns false instead.
  */
-function decrementOwned_(invSheet, side) {
+function decrementOwned_(invSheet, side, qty) {
   var rowNum = findInventoryRow_(invSheet, side);
   if (!rowNum) {
     SpreadsheetApp.getUi().alert(
@@ -548,13 +554,14 @@ function decrementOwned_(invSheet, side) {
   var cols = listColumns_(side.list);
   var cell = invSheet.getRange(rowNum, cols.owned);
   var current = Number(cell.getValue() || 0);
-  if (current < 1) {
+  if (current < qty) {
     SpreadsheetApp.getUi().alert(
       'Could not resolve: ' + side.set + ' ' + side.part + ' on List ' + side.list +
-      ' is already at 0 Owned (Inventory may have changed since Compare Lists last ran).');
+      ' only has ' + current + ' Owned but needs to decrement by ' + qty +
+      ' (Inventory may have changed since Compare Lists last ran).');
     return false;
   }
-  cell.setValue(current - 1);
+  cell.setValue(current - qty);
   return true;
 }
 
@@ -562,28 +569,34 @@ function decrementOwned_(invSheet, side) {
  * Increments the Owned cell for this side by 1. If no row currently exists
  * for this Set+Part (the part was previously inferred at Owned=0 with no
  * row on the sheet), a new row is inserted directly under the last known
- * row of that Set, with the Set cell left blank (since it's a continuation
- * of the existing Set block) and Owned set to 1.
+ * row of that Set, and Owned is set to 1.
  *
- * IMPORTANT: this uses Range.insertCells(Dimension.ROWS) scoped to just
- * this list's 3 columns (Set/Part/Owned), NOT Sheet.insertRowAfter().
- * insertRowAfter would insert a full-width row across the whole sheet,
- * shifting the *other* list's columns (which live on the same physical
- * rows but are a separate, unrelated list) down by one and corrupting
- * their alignment. insertCells confines the shift to this list's own
- * column range only, leaving the other list's rows completely untouched.
+ * The new row's Set cell is EXPLICITLY written with the Set name and its
+ * wanted-count suffix (e.g. "Wukong (1)"), rather than left blank. Leaving
+ * it blank relies on "inherits from the row above" -- which only works
+ * cleanly when the row above is a real merged cell or you're manually
+/**
+ * Increments the Owned cell for this side by qty. If no row currently
+ * exists for this Set+Part (the part was previously inferred at Owned=0
+ * with no row on the sheet), a new row is inserted directly under the
+ * last known row of that Set, with the Set cell left blank so it inherits
+ * the Set name from the row above via the standard carry-down convention,
+ * and Owned set to qty.
  *
- * Row lookup is always live, so this is safe to call after other Resolve
- * actions have already shifted rows earlier in the same session.
+ * Uses Range.insertCells(Dimension.ROWS) scoped to just this list's 3
+ * columns (Set/Part/Owned) rather than Sheet.insertRowAfter(), so the
+ * other list's columns (same physical rows, different columns) are never
+ * shifted. Row lookup is always live, so this is safe after earlier
+ * Resolve actions have already inserted/shifted rows in the same session.
  */
-function incrementOwned_(invSheet, side) {
+function incrementOwned_(invSheet, side, qty) {
   var cols = listColumns_(side.list);
   var rowNum = findInventoryRow_(invSheet, side);
 
   if (rowNum) {
     var cell = invSheet.getRange(rowNum, cols.owned);
     var current = Number(cell.getValue() || 0);
-    cell.setValue(current + 1);
+    cell.setValue(current + qty);
     return;
   }
 
@@ -596,10 +609,10 @@ function incrementOwned_(invSheet, side) {
   var numCols = lastCol - firstCol + 1;
 
   invSheet.getRange(insertAt, firstCol, 1, numCols).insertCells(SpreadsheetApp.Dimension.ROWS);
+  // Set cell intentionally left blank -- carries down from the row above,
+  // matching the "blank = inherit" convention you use on Inventory.
   invSheet.getRange(insertAt, cols.part).setValue(side.part);
-  invSheet.getRange(insertAt, cols.owned).setValue(1);
-  // Set (Wanted) cell intentionally left blank -- this row is a continuation
-  // of the existing Set block above it, matching the sheet's layout convention.
+  invSheet.getRange(insertAt, cols.owned).setValue(qty);
 }
 
 /**
@@ -628,12 +641,16 @@ function writeTable_(sheet, startRow, title, headers, rows) {
     return dataRow;
   }
 
+  // Write data columns A-D only (Set, Part, Ducats, Qty).
+  // Column E (Resolve) is intentionally excluded here -- insertCheckboxes()
+  // below will both apply the validation rule AND set initial value to false,
+  // so pre-writing false is unnecessary and risks confusing the range extent.
   var values = rows.map(function (r) {
-    return [r.set, r.part, r.ducats, r.qty, false]; // false = unchecked checkbox
+    return [r.set, r.part, r.ducats, r.qty];
   });
-  sheet.getRange(dataRow, 1, values.length, headers.length + 1).setValues(values);
+  sheet.getRange(dataRow, 1, values.length, headers.length).setValues(values);
 
-  // Insert checkboxes into the Resolve column.
+  // Insert checkboxes into the Resolve column (E) for exactly the data rows.
   var resolveRange = sheet.getRange(dataRow, RESOLVE_COL, values.length, 1);
   resolveRange.insertCheckboxes();
 
@@ -648,19 +665,17 @@ function writeTable_(sheet, startRow, title, headers, rows) {
 
 /**
  * Encodes a Resolve action's payload into a single pipe-delimited string
- * for storage in the hidden Trades column G. Each "side" is exactly 3
- * fields (list|set|part); the Inventory row to act on is looked up live
- * at resolve-time rather than cached, so the action stays correct even
- * if rows were inserted, deleted, or reordered on Inventory in between:
- *   "sell|A|Acceltra|Stock"
- *   "transfer|A|Acceltra|Stock|B|Acceltra|Stock"
+ * for storage in the hidden Trades column G. qty is encoded so the full
+ * amount is applied when Resolve is clicked rather than always 1:
+ *   "sell|4|A|Acceltra|Stock"
+ *   "transfer|2|A|Akarius|Barrel|B|Akarius|Barrel"
  */
 function encodeAction_(r) {
   function side(s) {
     return [s.list, s.set, s.part].join('|');
   }
   if (r.action === 'transfer') {
-    return 'transfer|' + side(r.from) + '|' + side(r.to);
+    return 'transfer|' + r.qty + '|' + side(r.from) + '|' + side(r.to);
   }
-  return 'sell|' + side(r.from);
+  return 'sell|' + r.qty + '|' + side(r.from);
 }
